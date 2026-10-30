@@ -1,0 +1,291 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <Adafruit_INA219.h>
+
+Adafruit_INA219 ina219;
+WebServer server(80);
+
+const char* AP_SSID = "PowerProof-Auto";
+const char* AP_PASSWORD = "Power1234";
+
+const int SDA_PIN = 21;
+const int SCL_PIN = 22;
+const int MOSFET_PIN = 25;
+
+// Measurements
+float voltage = 0.0;
+float currentMA = 0.0;
+float powerW = 0.0;
+float energyWh = 0.0;
+
+// Energy limit selected on dashboard
+float energyLimitWh = 1.0;
+
+// Adjustable startup grace period in seconds
+const unsigned long STARTUP_DELAY_SECONDS = 3;
+unsigned long fanStartTime = 0;
+
+bool fanOn = false;
+bool limitReached = false;
+
+unsigned long lastSensorRead = 0;
+unsigned long lastEnergyUpdate = 0;
+
+const char webpage[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PowerProof Auto</title>
+<style>
+body{margin:0;padding:18px;background:#101827;color:#f1f5f9;
+font-family:Arial,sans-serif}
+main{max-width:760px;margin:auto}
+h1{margin-bottom:5px}
+p{color:#a8b4c7}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.card,.panel{background:#1e293b;padding:18px;border-radius:12px;
+margin-top:12px}
+.label{font-size:14px;color:#a8b4c7}
+.value{font-size:25px;font-weight:bold;margin-top:10px}
+input,button{width:100%;padding:13px;margin-top:10px;
+box-sizing:border-box;border:0;border-radius:8px;font-size:16px}
+input{background:#0f172a;color:white}
+button{font-weight:bold;cursor:pointer}
+.start{background:#22c55e;color:#052e16}
+.stop{background:#ef4444;color:white}
+@media(max-width:420px){body{padding:10px}.value{font-size:21px}}
+</style>
+</head>
+<body>
+<main>
+<h1>PowerProof Auto</h1>
+<p>Energy-based power monitoring and shutoff</p>
+
+<div class="panel">
+ <div class="label">Fan status</div>
+ <div class="value" id="status">OFF</div>
+ <p id="message">Ready</p>
+</div>
+
+<div class="grid">
+ <div class="card"><div class="label">Voltage</div>
+ <div class="value"><span id="v">0</span> V</div></div>
+ <div class="card"><div class="label">Current</div>
+ <div class="value"><span id="i">0</span> mA</div></div>
+ <div class="card"><div class="label">Power</div>
+ <div class="value"><span id="p">0</span> W</div></div>
+ <div class="card"><div class="label">Energy consumed</div>
+ <div class="value"><span id="e">0</span> Wh</div></div>
+</div>
+
+<div class="panel">
+ <h3>Energy shutoff limit</h3>
+ <div class="label">Choose the maximum energy per run in Wh</div>
+ <input id="limit" type="number" min="0.01" max="1000"
+ value="1.00" step="0.01">
+ <button class="start" onclick="startFan()">START FAN</button>
+ <button class="stop" onclick="stopFan()">STOP FAN NOW</button>
+ <p>Selected limit: <b><span id="chosen">1.00</span> Wh</b></p>
+</div>
+</main>
+
+<script>
+const limitInput = document.getElementById('limit');
+
+limitInput.addEventListener('input', () => {
+  document.getElementById('chosen').textContent =
+    Number(limitInput.value || 0).toFixed(2);
+});
+
+async function update(){
+  try{
+    const r = await fetch('/data');
+    const d = await r.json();
+
+    document.getElementById('v').textContent =
+      Number(d.voltage).toFixed(2);
+    document.getElementById('i').textContent =
+      Number(d.currentMA).toFixed(1);
+    document.getElementById('p').textContent =
+      Number(d.powerW).toFixed(3);
+    document.getElementById('e').textContent =
+      Number(d.energyWh).toFixed(4);
+    document.getElementById('status').textContent =
+      d.fanOn ? 'ON' : 'OFF';
+    document.getElementById('message').textContent =
+      d.limitReached ? 'Energy limit reached — fan stopped' :
+      d.fanOn ? 'Monitoring energy consumption' : 'Ready / stopped';
+    document.getElementById('chosen').textContent =
+      Number(d.energyLimitWh).toFixed(2);
+  }catch(err){}
+}
+
+async function startFan(){
+  const limit = Number(limitInput.value);
+
+  if(!Number.isFinite(limit) || limit < 0.01 || limit > 1000){
+    alert('Enter an energy limit from 0.01 to 1000 Wh.');
+    return;
+  }
+
+  try{
+    const r = await fetch('/start?limit=' + encodeURIComponent(limit));
+    if(!r.ok){
+      alert('Could not start. Check the energy limit.');
+      return;
+    }
+    update();
+  }catch(err){
+    alert('Cannot connect to ESP32.');
+  }
+}
+
+async function stopFan(){
+  try{
+    await fetch('/stop');
+    update();
+  }catch(err){
+    alert('Cannot connect to ESP32.');
+  }
+}
+
+update();
+setInterval(update,1000);
+</script>
+</body>
+</html>
+)rawliteral";
+
+void setFan(bool state) {
+  fanOn = state;
+  digitalWrite(MOSFET_PIN, state ? HIGH : LOW);
+}
+
+void handleRoot() {
+  server.send_P(200, "text/html", webpage);
+}
+
+void handleData() {
+  String json = "{";
+  json += "\"voltage\":" + String(voltage, 3) + ",";
+  json += "\"currentMA\":" + String(currentMA, 2) + ",";
+  json += "\"powerW\":" + String(powerW, 4) + ",";
+  json += "\"energyWh\":" + String(energyWh, 5) + ",";
+  json += "\"energyLimitWh\":" + String(energyLimitWh, 3) + ",";
+  json += "\"fanOn\":" + String(fanOn ? "true" : "false") + ",";
+  json += "\"limitReached\":" +
+          String(limitReached ? "true" : "false");
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+void handleStart() {
+  if (!server.hasArg("limit")) {
+    server.send(400, "text/plain", "Energy limit missing");
+    return;
+  }
+
+  float requestedLimit = server.arg("limit").toFloat();
+
+  if (!isfinite(requestedLimit) ||
+      requestedLimit < 0.01 ||
+      requestedLimit > 1000.0) {
+    server.send(400, "text/plain", "Invalid energy limit");
+    return;
+  }
+
+  // Begin a new energy-measurement run
+  energyLimitWh = requestedLimit;
+  energyWh = 0.0;
+  limitReached = false;
+
+  unsigned long now = millis();
+  lastEnergyUpdate = now;
+  lastSensorRead = 0;
+
+  // Record startup time for grace period
+  fanStartTime = millis();
+  setFan(true);
+
+  server.send(200, "text/plain", "Fan started");
+}
+
+void handleStop() {
+  setFan(false);
+  server.send(200, "text/plain", "Fan stopped");
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  digitalWrite(MOSFET_PIN, LOW);
+  pinMode(MOSFET_PIN, OUTPUT);
+  setFan(false);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  if (!ina219.begin()) {
+    Serial.println("ERROR: INA219 not detected!");
+    while (true) {
+      digitalWrite(MOSFET_PIN, LOW);
+      delay(1000);
+    }
+  }
+
+  ina219.setCalibration_32V_2A();
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+
+  Serial.println("PowerProof Auto ready");
+  Serial.print("Dashboard: http://");
+  Serial.println(WiFi.softAPIP());
+
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.on("/start", handleStart);
+  server.on("/stop", handleStop);
+  server.begin();
+
+  lastEnergyUpdate = millis();
+}
+
+void loop() {
+  server.handleClient();
+
+  unsigned long now = millis();
+
+  if (now - lastSensorRead >= 250) {
+    lastSensorRead = now;
+
+    float busV = ina219.getBusVoltage_V();
+    float shuntMV = ina219.getShuntVoltage_mV();
+    float measuredMA = ina219.getCurrent_mA();
+
+    voltage = busV + shuntMV / 1000.0;
+    currentMA = measuredMA;
+    powerW = voltage * currentMA / 1000.0;
+
+    unsigned long elapsed = now - lastEnergyUpdate;
+
+    // Continue measuring energy during startup
+    if (fanOn && powerW > 0.0) {
+      energyWh += powerW * (elapsed / 3600000.0);
+
+      // Only allow energy-based shutoff after startup delay
+      if (millis() - fanStartTime >=
+              STARTUP_DELAY_SECONDS * 1000UL &&
+          energyWh >= energyLimitWh) {
+        energyWh = energyLimitWh;
+        limitReached = true;
+        setFan(false);
+        Serial.println("Energy limit reached. Fan OFF.");
+      }
+    }
+
+    lastEnergyUpdate = now;
+  }
+}
